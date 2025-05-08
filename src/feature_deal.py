@@ -12,12 +12,54 @@ def time_feature(df, name="time"):
     hours = t.dt.hour
     minutes = t.dt.minute
     seconds = t.dt.second
+    df["hours"] = hours
+    df["minutes"] = minutes
     df['time_frac'] = (hours * 3600 + minutes * 60 + seconds) / 86400.0
 
     # 3) 周期性编码
     df['sin_time'] = np.sin(2 * np.pi * df['time_frac'])
     df['cos_time'] = np.cos(2 * np.pi * df['time_frac'])
-    return df, ["sin_time", "cos_time", "time_frac"]
+    #
+    # def trading_stage(hour, minute):
+    #     if hour == 9 and minute < 30:
+    #         return 'pre_open'
+    #     elif hour == 9 and minute >= 30 or (hour == 10 or hour == 11):
+    #         return 'morning'
+    #     elif hour == 13 or (hour == 14 and minute < 30):
+    #         return 'afternoon'
+    #     else:
+    #         return 'close'
+    #
+    # df['trading_stage'] = df.apply(lambda row: trading_stage(row["hours"], row["minutes"]), axis=1)
+    # # 添加 One-Hot 编码
+    # stage_dummies = pd.get_dummies(df['trading_stage'], prefix='trading_stage')
+    # print(stage_dummies.columns.values.tolist())
+    # df = pd.concat([df, stage_dummies], axis=1)
+    # =======================================================
+    # 这里做的两个特征效果都不是很好，所以算了
+    # eps = 1e-8
+    #
+    # # amount_weight：加入稳健处理
+    # df["amount_weight"] = df["amount_delta"] / (df["amount_mean_20"] + eps)
+    # # 限制异常大值
+    # df["amount_weight"] = df["amount_weight"].clip(upper=5)
+    #
+    # # time_weight：维持原逻辑（通常合理）
+    # df['time_weight'] = np.exp(-((df['time_frac'] - 0.5) ** 2) / (2 * 0.2 ** 2))
+    #
+    # df["mean_close_std_20"] = df["close_price_std_20"].rolling(20, min_periods=1).mean().shift(1) + eps
+    # df["close_weight"] = df["close_price_std_20"] / df["mean_close_std_20"]
+    # # 限制close_weight的极端值
+    # df["close_weight"] = df["close_weight"].clip(upper=5)
+    #
+    # # composite_weight：权重归一化
+    # df["raw_composite_weight"] = df["time_weight"] * df["amount_weight"] * df["close_weight"]
+    # df["composite_weight"] = df["raw_composite_weight"] / (
+    #             df["raw_composite_weight"].rolling(20, min_periods=1).max() + eps)
+    # # weighted_price_change最终结果
+    # df['weighted_price_change'] = df['n_close'] * df['composite_weight']
+    # TODO:这里可以启用time_frac
+    return df, ["sin_time", "cos_time"]#, "time_frac"] # + stage_dummies.columns.values.tolist()
 
 def stock_feature(df):
     bid_cols = ['n_bid1', 'n_bid2', 'n_bid3', 'n_bid4', 'n_bid5']
@@ -66,7 +108,6 @@ def stock_feature(df):
     df["depth_bid"] = bsize_values.sum(axis=1)
     df["depth_ask"] = asize_values.sum(axis=1)
     df["amplitude"] = safe_divide(high_values - low_values, open_values)
-
     # 当前涨跌 now_up_down
     df["now_up_down"] = safe_divide(close_values - open_values, open_values, 0.0)
 
@@ -82,26 +123,53 @@ def stock_feature(df):
     df['amount'] = np.log1p(df['amount_delta'].values)
     # 返回所需的特征列
     feature_col_names = [
-        'n_bid1', 'n_bsize1', 'n_bid2', 'n_bsize2', 'n_bid3', 'n_bsize3',
-        'n_bid4', 'n_bsize4', 'n_bid5', 'n_bsize5', 'n_ask1', 'n_asize1',
-        'n_ask2', 'n_asize2', 'n_ask3', 'n_asize3', 'n_ask4', 'n_asize4',
-        'n_ask5', 'n_asize5', 'spread1', 'mid_price1', 'spread2', 'mid_price2',
+        # 'n_bid1', 'n_bsize1', 'n_bid2', 'n_bsize2', 'n_bid3', 'n_bsize3',
+        # 'n_bid4', 'n_bsize4', 'n_bid5', 'n_bsize5', 'n_ask1', 'n_asize1',
+        # 'n_ask2', 'n_asize2', 'n_ask3', 'n_asize3', 'n_ask4', 'n_asize4',
+        # 'n_ask5', 'n_asize5',
+        'spread1', 'mid_price1', 'spread2', 'mid_price2',
         'spread3', 'mid_price3', 'weighted_ab1', 'weighted_ab2', 'weighted_ab3',
         'amount', 'vol1_rel_diff', 'volall_rel_diff', "depth_ask", "depth_bid",
         "amplitude", "now_up_down", "now_location", "bias_midprice", "william_R"]
     return df, feature_col_names
 
-def main_feature(df, only_columns=False):
+def group_deal(df, group, name, window_length_list, _type="ORI"):
+    for window_length in window_length_list:
+        rolling = group.rolling(window=window_length)
+        if _type == "TWAP":
+            t_rolling = group.ewm(span=window_length, adjust=False, min_periods=1)
+            df[f"{name}_mean_{window_length}"] = t_rolling.mean()
+        else:
+            df[f"{name}_mean_{window_length}"] = rolling.mean()
+        df[f"{name}_min_{window_length}"] = rolling.min()
+        df[f"{name}_max_{window_length}"] = rolling.max()
+        df[f"{name}_std_{window_length}"] = rolling.std()
+
+def window_feature(df):
+    window_length_list = [40]#, 10, 20, 40]
+    features = ["mean", "min", "max", "std"]
+    amount_group = df.groupby(["sym", "date"])["amount_delta"].shift()
+    close_group = df.groupby(["sym", "date"])["n_close"].shift()
+    group_deal(df, amount_group, "amount", window_length_list, _type="TWAP")
+    group_deal(df, close_group, "close_price", window_length_list, _type="TWAP")
+    return df, [f"{k}_{j}_{i}" for i in window_length_list for j in features for k in ["amount", "close_price"]]
+
+def main_feature(df, only_columns=False, sym_get=False):
     """返回df一定要保留sym列，之后要使用对应sym的模型进行预测"""
     total = []
     if only_columns:
         df = df.iloc[:1].copy()
-    for func in [time_feature, stock_feature]:
+    for func in [stock_feature, window_feature, time_feature]:
         df, t = func(df)
         total.extend(t)
     if only_columns:
+        if sym_get:
+            return total, df["sym"].values[0]
         return total
-    return df[total + ["sym"]]
+    try:
+        return df[total + ["sym", "label_5"]].dropna(), total
+    except:
+        return df[total + ["sym"]].dropna(), total
 
 
 
