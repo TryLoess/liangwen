@@ -240,8 +240,14 @@ def compute_trend_tstat(group, col, window=20, long=True, epsilon=1e-8):
     group[f'trend_tstat_{window}'] = t_stat
     return group
 
+def score(y_val, y_pred):
+    acc = accuracy_score(y_val, y_pred)
+    rec = recall_score(y_val, y_pred, average='macro')
 
-def train_model(X_train, y_train, X_val, y_val, model, grid_search=False, sym=False):
+    print(f"验证集准确率 (Accuracy): {acc:.4f}")
+    print(f"验证集召回率 (Recall):   {rec:.4f}")
+    return acc
+def train_model(X_train, y_train, X_val, y_val, model, grid_search=False, sym=False, prob=False, use_fobj=False):
     """"""
     model_name = {LGBMClassifier: "lgb", XGBClassifier: "xgb"}
     if grid_search:
@@ -265,19 +271,39 @@ def train_model(X_train, y_train, X_val, y_val, model, grid_search=False, sym=Fa
         print("最佳参数：", best_params)
     else:
         best_params = {'learning_rate': 0.1, 'max_depth': 7, 'n_estimators': 300, 'subsample': 0.8}
-    use_model = model(**best_params, random_state=42, objective='multiclass', n_jobs=4)
-    use_model.fit(X_train, y_train)
+    lgbm_loss = approx_fbeta_loss(beta=0.5, eps=1e-10, num_class=3)
+    if use_fobj:
+        train_data = lgb.Dataset(X_train, label=y_train)
+        valid_data = lgb.Dataset(X_val, label=y_val)
 
-    y_pred = use_model.predict(X_val)
+        # 设置 LightGBM 参数
+        params = {
+            'objective': 'multiclass',
+            'num_class': 3,
+            'metric': 'multi_logloss',
+            'learning_rate': 0.1, 
+            # 'max_depth': 7,
+            "num_leaves": 128,
+             'num_iterations': 100, 
+             'subsample': 0.8
+        }
 
-    acc = accuracy_score(y_val, y_pred)
-    rec = recall_score(y_val, y_pred, average='macro')
+        # 使用原生 LightGBM API 进行训练，并传递自定义损失函数
+        use_model = lgb.train(params, train_data, fobj=lgbm_loss)
+    else:
+        use_model = model(**best_params, random_state=42, objective='multiclass', n_jobs=4, is_unbalance=True)
+        use_model.fit(X_train, y_train)
 
-    print(f"验证集准确率 (Accuracy): {acc:.4f}")
-    print(f"验证集召回率 (Recall):   {rec:.4f}")
-    if type(sym) == int:
-        joblib.dump(use_model, get_dir_name(True) + f"/models/{model_name[model]}_sym{sym}_acc{acc:.3f}.pkl")
-    return use_model
+    if not prob:
+        y_pred = use_model.predict(X_val, raw_score=True)
+        print(y_pred)
+        acc = score(y_val, y_pred)
+ 
+        if type(sym) == int:
+            joblib.dump(use_model, get_dir_name(True) + f"/models/{model_name[model]}_sym{sym}_acc{acc:.3f}.pkl")
+        return use_model
+    else:
+        return use_model.predict_proba(X_train)
 
 def plot_importance(model):
     if type(model) == LGBMClassifier:
@@ -294,3 +320,54 @@ def plot_importance(model):
         xgboost.plot_importance(model, max_num_features=20, importance_type="split", figsize=(10, 6))
         plt.title("XGB feature importance")
         plt.show()
+
+
+def softmax(logits):
+    """将 logits 转为 softmax 概率分布"""
+    e = np.exp(logits - np.max(logits, axis=1, keepdims=True))
+    return e / np.sum(e, axis=1, keepdims=True)
+
+def approx_fbeta_loss(beta=0.5, eps=1e-10, num_class=3):
+    beta2 = beta ** 2
+
+    def loss(y_pred, data):
+        y_true = data.get_label().astype(int)
+        y_pred = y_pred.reshape(-1, num_class)
+        y_prob = softmax(y_pred)  # shape (N, C)
+
+        grad = np.zeros_like(y_prob)
+        hess = np.zeros_like(y_prob)
+
+        for c in range(num_class):
+            # 第 c 类的标签指示 (one-hot)
+            y_true_c = (y_true == c).astype(float)  # shape (N,)
+            y_pred_c = y_prob[:, c]                # shape (N,)
+
+            # 为每个样本构造 surrogate Fβ loss:
+            # L = - ((1 + β²) * y_true * y_pred) / (β² * y_pred + y_pred + y_true + eps)
+            # 这是一个可导的近似
+
+            numerator = (1 + beta2) * y_true_c * y_pred_c
+            denominator = beta2 * y_pred_c + (1 - y_pred_c) + y_true_c + eps
+            loss_val = - numerator / denominator
+
+            # ∂L/∂y_pred_c
+            dnumerator = (1 + beta2) * y_true_c
+            ddenominator = beta2 - 1  # ∂denominator/∂y_pred_c
+            grad_c = - (dnumerator * denominator - numerator * ddenominator) / (denominator ** 2)
+
+            # ∂²L/∂y_pred_c²
+            d2numerator = 0
+            d2denominator = 0
+            numerator_term = dnumerator * denominator - numerator * ddenominator
+            denominator_term = denominator ** 2
+            dnumerator_term = - (dnumerator * ddenominator + dnumerator * ddenominator - numerator * d2denominator)
+            ddenominator_term = 2 * denominator * ddenominator
+            hess_c = (dnumerator_term * denominator_term - numerator_term * ddenominator_term) / (denominator_term ** 2 + eps)
+
+            grad[:, c] = grad_c
+            hess[:, c] = np.maximum(hess_c, 1e-6)  # 保证非负，避免 LightGBM 报错
+
+        return grad.flatten(), hess.flatten()
+
+    return loss
